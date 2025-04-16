@@ -41,7 +41,13 @@ from .const import (
     RECOMMENDED_TEMPERATURE,
     RECOMMENDED_TOP_P,
     CONF_BASE_URL,
-    RECOMMENDED_BASE_URL
+    RECOMMENDED_BASE_URL,
+    CONF_MEMOBASE_ENABLED,
+    CONF_MEMOBASE_URL, 
+    CONF_MEMOBASE_API_KEY,
+    CONF_MEMOBASE_USER_ID,
+    DEFAULT_MEMOBASE_URL,
+    DEFAULT_MEMOBASE_API_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -187,6 +193,30 @@ def openai_compatible_config_option_schema(
             CONF_RECOMMENDED, default=options.get(CONF_RECOMMENDED, False)
         ): bool,
     }
+
+    # Add Memobase configuration options
+    schema.update(
+        {
+            vol.Optional(
+                CONF_MEMOBASE_ENABLED, 
+                default=options.get(CONF_MEMOBASE_ENABLED, False)
+            ): bool,
+            vol.Optional(
+                CONF_MEMOBASE_URL,
+                description={"suggested_value": options.get(CONF_MEMOBASE_URL, DEFAULT_MEMOBASE_URL)},
+                default=DEFAULT_MEMOBASE_URL,
+            ): str,
+            vol.Optional(
+                CONF_MEMOBASE_API_KEY,
+                description={"suggested_value": options.get(CONF_MEMOBASE_API_KEY, DEFAULT_MEMOBASE_API_KEY)},
+                default=DEFAULT_MEMOBASE_API_KEY,
+            ): str,
+            vol.Optional(
+                CONF_MEMOBASE_USER_ID,
+                description={"suggested_value": options.get(CONF_MEMOBASE_USER_ID)},
+            ): str,
+        }
+    )
 
     if options.get(CONF_RECOMMENDED):
         return schema
