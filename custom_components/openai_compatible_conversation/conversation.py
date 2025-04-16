@@ -107,8 +107,9 @@ def _convert_content_to_param(
         )
     if content.role != "assistant" or not content.tool_calls:  # type: ignore[union-attr]
         role = content.role
-        if role == "system":
-            role = "developer"
+        # role "developer" not supported by LM Studio
+        #if role == "system":
+        #    role = "developer"
         return cast(
             ChatCompletionMessageParam,
             {"role": role, "content": content.content},  # type: ignore[union-attr]
