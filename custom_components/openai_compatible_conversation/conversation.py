@@ -4,6 +4,9 @@ from collections.abc import Callable
 import json
 from typing import Any, Literal, cast
 
+import asyncio
+from datetime import datetime
+
 import openai
 from openai._types import NOT_GIVEN
 from openai.types.chat import (
@@ -27,6 +30,7 @@ from homeassistant.helpers import chat_session, device_registry as dr, intent, l
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import OpenAICompatibleConfigEntry
+from .memobase_client import MemobaseManager
 from .const import (
     CONF_CHAT_MODEL,
     CONF_MAX_TOKENS,
@@ -39,6 +43,12 @@ from .const import (
     RECOMMENDED_MAX_TOKENS,
     RECOMMENDED_TEMPERATURE,
     RECOMMENDED_TOP_P,
+    CONF_MEMOBASE_ENABLED,
+    CONF_MEMOBASE_URL,
+    CONF_MEMOBASE_API_KEY,
+    CONF_MEMOBASE_USER_ID,
+    DEFAULT_MEMOBASE_URL,
+    DEFAULT_MEMOBASE_API_KEY,
 )
 
 # Max number of back and forth with the LLM to generate a response
@@ -153,6 +163,32 @@ class OpenAICompatibleConversationEntity(
             model="OpenAI Compatible",
             entry_type=dr.DeviceEntryType.SERVICE,
         )
+        
+        # Initialize Memobase client if enabled
+        self.memobase = None
+        options = self.entry.options
+        if options.get(CONF_MEMOBASE_ENABLED, False):
+            try:
+                memobase_url = options.get(CONF_MEMOBASE_URL, DEFAULT_MEMOBASE_URL)
+                memobase_api_key = options.get(CONF_MEMOBASE_API_KEY, DEFAULT_MEMOBASE_API_KEY)
+                memobase_user_id = options.get(CONF_MEMOBASE_USER_ID)
+                
+                LOGGER.info(
+                    "Initializing Memobase with URL: %s, User ID: %s", 
+                    memobase_url, memobase_user_id or "auto-generated"
+                )
+                
+                self.memobase = MemobaseManager(
+                    self.hass,
+                    url=memobase_url,
+                    api_key=memobase_api_key,
+                    user_id=memobase_user_id,
+                )
+                
+                # We'll connect asynchronously later
+            except Exception as err:
+                LOGGER.error("Error initializing Memobase: %s", err)
+                
         if self.entry.options.get(CONF_LLM_HASS_API):
             self._attr_supported_features = (
                 conversation.ConversationEntityFeature.CONTROL
@@ -166,6 +202,22 @@ class OpenAICompatibleConversationEntity(
     async def async_added_to_hass(self) -> None:
         """When entity is added to Home Assistant."""
         await super().async_added_to_hass()
+        
+        # Initialize Memobase connection if configured
+        if self.memobase:
+            try:
+                if await self.memobase.connect():
+                    # Update config entry with the user ID if it was auto-generated
+                    if not self.entry.options.get(CONF_MEMOBASE_USER_ID) and self.memobase.user_id:
+                        new_options = dict(self.entry.options)
+                        new_options[CONF_MEMOBASE_USER_ID] = self.memobase.user_id
+                        self.hass.config_entries.async_update_entry(
+                            self.entry, options=new_options
+                        )
+                        LOGGER.info("Updated config with Memobase user ID: %s", self.memobase.user_id)
+            except Exception as err:
+                LOGGER.error("Error connecting to Memobase: %s", err)
+                
         assist_pipeline.async_migrate_engine(
             self.hass, "conversation", self.entry.entry_id, self.entity_id
         )
@@ -176,6 +228,9 @@ class OpenAICompatibleConversationEntity(
 
     async def async_will_remove_from_hass(self) -> None:
         """When entity will be removed from Home Assistant."""
+        # Clean up Memobase resources
+        self.memobase = None
+        
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
@@ -190,6 +245,17 @@ class OpenAICompatibleConversationEntity(
             conversation.async_get_chat_log(self.hass, session, user_input) as chat_log,
         ):
             return await self._async_handle_message(user_input, chat_log)
+        
+    def _is_conversation_end(self, user_message: str) -> bool:
+        """Determine if this appears to be the end of a conversation."""
+        # Simple heuristic to detect conversation end
+        # Could be expanded with more sophisticated detection
+        farewell_phrases = [
+            "thank you", "thanks", "goodbye", "bye", "good night", 
+            "see you later", "talk to you later", "that's all"
+        ]
+        
+        return any(phrase in user_message.lower() for phrase in farewell_phrases)
 
     async def _async_handle_message(
         self,
@@ -218,6 +284,31 @@ class OpenAICompatibleConversationEntity(
             ]
         
         messages = [_convert_content_to_param(content) for content in chat_log.content]
+
+        # Add Memobase user profile to system prompt if available
+        if self.memobase:
+            user_profile = await self.memobase.get_user_profile(
+                max_tokens=500, 
+                prefer_topics=["basic_info", "preferences", "interests"]
+            )
+            
+            if user_profile:
+                # If there's already a system message, enhance it
+                system_message_found = False
+                for i, message in enumerate(messages):
+                    if message["role"] == "system":
+                        # Append memory context to existing system message
+                        messages[i]["content"] = f"{message['content']}\n\n{user_profile}"
+                        system_message_found = True
+                        break
+                        
+                # If no system message found, add one
+                if not system_message_found:
+                    system_message = {
+                        "role": "system",
+                        "content": user_profile
+                    }
+                    messages.insert(0, system_message)
 
         client = self.entry.runtime_data
 
@@ -271,6 +362,26 @@ class OpenAICompatibleConversationEntity(
                     )
                 ]
             )
+
+            # After processing, store conversation in Memobase if enabled
+            if self.memobase and response.content:
+                # Get the entity name, or fall back to "Kitty" if not set
+                agent_name = self.name or "Kitty"
+                
+                # Store the conversation
+                await self.memobase.store_conversation(
+                    user_input.text,
+                    response.content,
+                    assistant_name=agent_name
+                )
+                
+                # Determine if we should flush the buffer
+                should_flush = self._is_conversation_end(user_input.text)
+                
+                # Flush the buffer if it appears to be the end of a conversation
+                if should_flush:
+                    LOGGER.info("Detected conversation end, flushing Memobase buffer")
+                    asyncio.create_task(self.memobase.flush_buffer())
 
             if not tool_calls:
                 break
