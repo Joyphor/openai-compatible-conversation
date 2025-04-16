@@ -29,7 +29,7 @@ class MemobaseManager:
             user_id: Optional user ID to use
         """
         self.hass = hass
-        self.client = AsyncMemobaseClient(project_url=url, api_key=api_key)
+        self.client = AsyncMemoBaseClient(project_url=url, api_key=api_key)
         self.user = None
         self.user_id = user_id
         self._connected = False
